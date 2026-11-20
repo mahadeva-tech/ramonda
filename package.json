@@ -11,13 +11,13 @@
     "automation",
     "cli"
   ],
-  "homepage": "https://github.com/maticluka999/ramonda#readme",
+  "homepage": "https://github.com/mahadeva-tech/ramonda#readme",
   "bugs": {
-    "url": "https://github.com/maticluka999/ramonda/issues"
+    "url": "https://github.com/mahadeva-tech/ramonda/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/maticluka999/ramonda.git"
+    "url": "git+https://github.com/mahadeva-tech/ramonda.git"
   },
   "license": "MIT",
   "author": "Luka Matic (https://github.com/maticluka999)",

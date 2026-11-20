@@ -31,7 +31,7 @@ While you sleep, workout or chill - Ramonda works for you!
 **Install**
 
 ```sh
-git clone https://github.com/maticluka999/ramonda.git
+git clone https://github.com/mahadeva-tech/ramonda.git
 cd ramonda
 npm install
 npm run build
