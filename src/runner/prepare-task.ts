@@ -1,9 +1,10 @@
 import { cp, mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import type winston from 'winston';
+import { STATUS_VALUES } from '../constants/github.js';
 import { installWorktreeHooks } from '../hooks/install.js';
 import { TERMINAL } from '../utils/logger.js';
-import type { FoundTask, TaskState, WorktreeConfig } from '../types.js';
+import type { FoundTask, TaskStart, TaskState, WorktreeConfig } from '../types.js';
 import { quoteAll } from '../utils/quote-all.js';
 import { truncate } from '../utils/truncate.js';
 import { Git } from '../wrappers/git.js';
@@ -29,6 +30,14 @@ export class PickupAborted extends Error {
  * the same broken setup three times over.
  */
 export class SetupError extends Error {}
+
+/**
+ * Thrown where pickup finds the task cannot start until somebody steps in — a
+ * kept branch that will not merge its base. Not a failure of ramonda's: the task
+ * is cancelled with the reason, and the pass goes on without spending the no-PR
+ * budget, since no session was started.
+ */
+export class StartCancelled extends Error {}
 
 /** How much of a failed setup command's output reaches the log line. */
 const MAX_SEED_OUTPUT_CHARS = 4096;
@@ -130,6 +139,24 @@ async function seedWorktree(args: {
   );
 }
 
+/**
+ * What a stacked task is told about the work under it — where it is and that it
+ * is already there, and not what it says. The blocker's own description stays out
+ * of the prompt: the code is what the session builds on, and it can read that.
+ */
+function renderBuildsOn(start: TaskStart): string {
+  if (!start.blocker || !start.stackedOn) {
+    return '';
+  }
+
+  return `## Builds on
+
+This task depends on #${start.blocker.number} "${start.blocker.title}", implemented in PR ${start.stackedOn.url} on branch \`${start.stackedOn.branch}\`.
+Your branch was cut from that branch, so its changes are already here — build on them.
+
+`;
+}
+
 /** The prompt the session opens on, and the file `.claude/AGENT_TASK.md` holds. */
 function renderTaskBrief(vars: {
   title: string;
@@ -137,6 +164,7 @@ function renderTaskBrief(vars: {
   branch: string;
   number: number;
   repoNameWithOwner: string;
+  start: TaskStart;
 }): string {
   return `# Task: ${vars.title}
 
@@ -147,7 +175,7 @@ Branch: \`${vars.branch}\`
 
 ${vars.body}
 
-## Instructions
+${renderBuildsOn(vars.start)}## Instructions
 
 Implement the task described above in the current working directory. Stay on branch \`${vars.branch}\`.
 
@@ -172,6 +200,8 @@ Closes #${vars.number}
 export async function prepareTask(args: {
   opts: RunOpts;
   task: FoundTask;
+  /** Where the branch is cut from and the PR targets, as the task's blocker settled it. */
+  start: TaskStart;
   /** Bound to the base checkout — the only tree ramonda runs `fetch` against. */
   git: Git;
   branch: string;
@@ -180,7 +210,7 @@ export async function prepareTask(args: {
   /** Recorded in the task state, so the hooks log to the log the loop opened. */
   taskLogFile: string;
 }): Promise<{ brief: string; taskState: TaskState }> {
-  const { opts, task, git, branch, worktreePath, taskLog, taskLogFile } = args;
+  const { opts, task, start, git, branch, worktreePath, taskLog, taskLogFile } = args;
   const checkpoint = (): void => {
     if (opts.shutdownSignal.aborted) {
       throw new PickupAborted();
@@ -193,12 +223,9 @@ export async function prepareTask(args: {
   // check out and fast-forward first.
   await git.fetchOrigin();
 
-  const prep = await git.prepTaskWorktree({
-    worktreePath,
-    branch,
-    baseRef: `origin/${opts.repoConfig.baseBranch}`,
-  });
-  taskLog.info(`worktree prepared (reused=${prep.reused})`);
+  const baseRef = `origin/${start.baseBranch}`;
+  const prep = await git.prepTaskWorktree({ worktreePath, branch, baseRef });
+  taskLog.info(`worktree prepared (reused=${prep.reused}, created=${prep.created}, base=${baseRef})`);
 
   // The authoritative gitignore check, as against startup's pre-flight: this is
   // the tree the session actually gets, and a `.gitignore` committed but never
@@ -227,6 +254,24 @@ export async function prepareTask(args: {
     opts.mainLogger.info(msg, TERMINAL);
   }
 
+  // A task with a blocker that comes back for another round keeps its branch,
+  // cut from whatever the blocker was the first time. The blocker may have moved
+  // on since — reworked after its own review, or merged into the base — so its
+  // latest is brought in before the session builds on top of it. Only for tasks
+  // with a blocker: a plain task's kept branch stays as it always has.
+  if (start.blocker && !prep.created) {
+    const merged = await new Git(worktreePath, { commitIdentity: opts.commitIdentity }).merge(baseRef);
+
+    if (!merged) {
+      throw new StartCancelled(
+        `${baseRef} does not merge cleanly into ${branch} — resolve the conflict by hand, ` +
+          `then move this issue back to ${STATUS_VALUES.todo}.`
+      );
+    }
+
+    taskLog.info(`merged ${baseRef} into the kept branch`);
+  }
+
   // Before the brief, so a worktree the session cannot work in costs a setup
   // command rather than a whole session — and before the task state write, so a
   // failure here unwinds through the claim guard with no cancel to deliver.
@@ -245,6 +290,7 @@ export async function prepareTask(args: {
     branch,
     number: task.issue.number,
     repoNameWithOwner: opts.repoNameWithOwner,
+    start,
   });
 
   const briefPath = join(worktreePath, '.claude', 'AGENT_TASK.md');
@@ -270,7 +316,9 @@ export async function prepareTask(args: {
     issue: task.issue.number,
     issueTitle: task.issue.title,
     branch,
-    baseBranch: opts.repoConfig.baseBranch,
+    // The blocker's branch for a stacked task: the Stop hook measures the
+    // session's work against it, and the PR targets it.
+    baseBranch: start.baseBranch,
     repoNameWithOwner: opts.repoNameWithOwner,
     workspacePath: opts.workspacePath,
     worktreePath,

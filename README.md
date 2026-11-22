@@ -177,15 +177,45 @@ The project it polls comes from `ramonda.json` — `project.owner` and `project.
 
 Each pass:
 
-- finds the highest-priority `Todo` issue in the project that carries the `ramonda` label, belongs to this repo and is unclaimed
+- finds the highest-priority `Todo` issue in the project that carries the `ramonda` label, belongs to this repo, is unclaimed and can start (see [Dependent issues](#dependent-issues))
 - claims the issue
 - works it end to end in a git worktree of its own: prep and seed the worktree → Claude Code session → verify → commit → push → open a PR → move the item to `Ready for review`.
 
 The next pass starts right away; with nothing to work on, Ramonda sleeps `<poll-pause>` seconds and looks again. A failed task releases what it took, logs why, and polls again after the same pause; three tasks in a row that produce no pull request end the run.
 
-Worktrees live under `.worktrees/` at the repo root, each cut from `origin/<baseBranch>`. Nothing Ramonda runs touches the branch, index or working tree of the checkout you started from, so you can keep working there while the loop runs, and several `ramonda` processes can share one clone.
+Worktrees live under `.worktrees/` at the repo root, each cut from `origin/<baseBranch>`, or from the blocker's branch for a dependent issue. Nothing Ramonda runs touches the branch, index or working tree of the checkout you started from, so you can keep working there while the loop runs, and several `ramonda` processes can share one clone.
 
 Commits, the PR, the project moves and the issue comment all come from the account `GH_TOKEN` belongs to. The **push** is the one exception: over an HTTPS origin it still authenticates with `GH_TOKEN`, through a one-shot git credential helper, but over an SSH origin it authenticates with whatever key your SSH agent offers instead, so the pushing identity can differ from `GH_TOKEN`'s account. Sessions are headless, with permission prompts disabled and one prompt each. `Ctrl-C` ends the loop cleanly, cancelling, commenting on and releasing a task in flight; a `SIGTERM` from a supervisor does the same.
+
+#### Dependent issues
+
+An issue can depend on another one through Github's own **Blocked by** relationship, set in the issue's sidebar. Ramonda supports exactly one blocker per issue, in the same repository.
+
+A blocked issue waits in `Todo` until its blocker is **done**, meaning its `Status` is `Ready for review` or any column after it. Ramonda then finds the blocker's branch among the repo's open PRs, as the one whose branch starts with `<blocker-#>-`. Every branch Ramonda creates is named that way. A PR you open yourself for a blocker counts only if its branch follows the same naming. Once the blocker's branch is found, Ramonda:
+
+- cuts the dependent's branch from the blocker's branch
+- opens the dependent's PR **against the blocker's branch**, so its diff holds only its own work
+- tells the session in its brief which PR and branch it builds on
+
+If the blocker has no open PR and its issue was closed as completed, its work is already in `baseBranch`, and the dependent starts from there as usual.
+
+The blocker is checked once, at pickup. Nothing that happens to it after that affects a task that has already started. When a dependent comes back to `Todo` after review, the check runs again, and the latest blocker branch, or `baseBranch` if the blocker was merged, is merged into the dependent's existing branch before the session.
+
+Ramonda doesn't wait on a chain of blockers level by level. When an issue waits on a blocker, Ramonda follows the chain back to the first issue that can start and works on that one first, whatever its `Priority`. That issue still has to carry the `ramonda` label and be in `Todo`. The chain is followed for at most 10 links. A level where every issue is waiting is skipped, and Ramonda moves on to the next one.
+
+Ramonda moves an issue to `Cancelled` and comments with the reason when its dependency can't resolve on its own:
+
+- the issue has more than one blocker
+- the blocker is done but has more than one open PR to build on
+- the blocker is done but has no open PR to build on, and wasn't closed as completed
+- merging the blocker's latest into a kept branch conflicts
+
+None of these start a session, so they don't count against the three-tasks-without-a-PR limit. Fix the dependency and move the issue back to `Todo`. An issue blocked by an issue in another repository is skipped and left in `Todo`.
+
+Two things to set up on the repository:
+
+- **Turn on "Automatically delete head branches"** (Settings → General → Pull Requests). When a blocker's PR is merged and its branch is deleted, Github retargets the dependent's PR to the blocker's base. If the branch stays, the dependent's PR keeps targeting it, and merging the dependent puts its work into a branch that's already merged and never reaches `baseBranch`.
+- **Squash merges need a hand.** A squash-merged blocker lands as one new commit, while the dependent's branch still carries the blocker's original commits. After retargeting, the dependent's PR shows the blocker's changes again and may conflict. Merge `baseBranch` into the dependent's branch before merging it, or send the dependent back to `Todo` so Ramonda does that merge. Regular merge commits don't have this problem.
 
 ## Trivia
 

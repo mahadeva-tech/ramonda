@@ -316,6 +316,88 @@ export type FoundTask = {
    * did was the one for issues carrying no level at all.
    */
   priorityHit: string;
+  /** The issues blocking this one, read by the same query that found it. */
+  blockedBy: Blockers;
+};
+
+/**
+ * An issue blocking another, as the poll read it — enough for `decideStart` to
+ * settle whether the issue it blocks can start, and from which branch.
+ */
+export type Blocker = {
+  number: number;
+  title: string;
+  /** `OPEN` or `CLOSED`. */
+  state: string;
+  /** Why a closed issue was closed — `COMPLETED`, `NOT_PLANNED`, `DUPLICATE`. Null while it is open. */
+  stateReason: string | null;
+  repoNameWithOwner: string;
+  /** Its item on the run's project; absent where the issue is not on it. */
+  itemId?: string;
+  /** Its `Status` on the run's project; absent where it has none, or is not on the project. */
+  status?: string;
+};
+
+/**
+ * The issues blocking one issue. `blockers` holds at most two of them, which is
+ * all it takes to tell "one" from "more than one" — the only question ramonda
+ * asks of the rest. `totalCount` is the real number.
+ */
+export type Blockers = {
+  totalCount: number;
+  blockers: Blocker[];
+};
+
+/**
+ * An issue read on its own while following a dependency chain: a blocker, and
+ * possibly the task to work in place of the one it blocks.
+ */
+export type ChainIssue = Blocker & {
+  body: string;
+  labels: string[];
+  blockedBy: Blockers;
+};
+
+/** An open pull request, as `decideStart` matches one to a blocker by its branch. */
+export type OpenPullRequest = {
+  url: string;
+  headRefName: string;
+  /** Absent where the head repository is gone — a deleted fork. */
+  headRepoNameWithOwner?: string;
+};
+
+/**
+ * Where a task's branch is cut from and its pull request targets — settled at
+ * pickup by its blocker, and by nothing after.
+ */
+export type TaskStart = {
+  /** `baseBranch` from `ramonda.json`, or the blocker's branch where the task is stacked on it. */
+  baseBranch: string;
+  /** The issue blocking this one, where it has one. */
+  blocker?: { number: number; title: string };
+  /** The blocker's open pull request, where the task is stacked on its branch. */
+  stackedOn?: { url: string; branch: string };
+};
+
+/** One blocking issue as the query reports it — `toBlocker` turns it into a `Blocker`. */
+export type RawBlocker = {
+  number: number;
+  title: string;
+  state: string;
+  stateReason: string | null;
+  repository: { nameWithOwner: string };
+  projectItems: {
+    nodes: Array<{
+      id: string;
+      project: { id: string };
+      fieldValueByName: { name?: string } | null;
+    } | null>;
+  };
+};
+
+export type RawBlockedBy = {
+  totalCount: number;
+  nodes: Array<RawBlocker | null>;
 };
 
 export type RateLimitCall = {
@@ -335,6 +417,7 @@ export type TaskNode = {
     number?: number;
     title?: string;
     body?: string;
+    blockedBy?: RawBlockedBy;
   };
 };
 

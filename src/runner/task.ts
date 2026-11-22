@@ -8,23 +8,37 @@ import {
   TASK_LABEL,
 } from '../constants/github.js';
 import { closeLogger, createLogger, taskLogPath, TERMINAL } from '../utils/logger.js';
-import type { FoundTask, RateLimitCall } from '../types.js';
+import type { Blockers, FoundTask, OpenPullRequest, RateLimitCall, TaskStart } from '../types.js';
 import { formatRateLimitHeaders } from '../wrappers/github.js';
 import { slugify } from '../utils/slugify.js';
 import { Git } from '../wrappers/git.js';
 import { cancelTask } from './cancel.js';
 import { claimRefFor, claimTask, releaseTask } from './claim.js';
-import { PickupAborted, prepareTask } from './prepare-task.js';
+import { decideStart, followChain, type StartDecision } from './dependencies.js';
+import { PickupAborted, prepareTask, StartCancelled } from './prepare-task.js';
 import type { RunOpts, TaskOutcome } from './runner.js';
 import { startSessionWithRateLimitLoop } from './session.js';
 import { settleTask } from './settle-task.js';
 import { readTaskState } from './task-state.js';
 
 type ClaimOutcome =
-  | { kind: 'won'; task: FoundTask; calls: RateLimitCall[] }
+  | { kind: 'won'; task: FoundTask; start: TaskStart }
   | { kind: 'empty' }
   | { kind: 'all-lost' }
-  | { kind: 'all-cooling' };
+  | { kind: 'all-cooling' }
+  /** Every candidate waits on a blocker, or on a dependency ramonda does not support. */
+  | { kind: 'all-blocked'; waiting: number[] };
+
+/**
+ * What one poll carries from level to level: the answers it would otherwise ask
+ * Github for twice, and the tasks it found waiting.
+ */
+type PollPass = {
+  decide: (blockedBy: Blockers) => Promise<StartDecision>;
+  /** Issues this poll already tried to claim — two waiting tasks can share the head of a chain. */
+  tried: Set<number>;
+  waiting: number[];
+};
 
 /**
  * How long after finishing with an issue this process refuses to pick it up again.
@@ -76,70 +90,259 @@ function formatRateLimit(calls: RateLimitCall[]): string {
   return calls.map((c) => `[${c.priority}] ${formatRateLimitHeaders(c.rateLimit)}`).join('; ');
 }
 
+/**
+ * Finds the task to work and claims it: the levels highest first, each level's
+ * candidates in order, each candidate standing in for the head of its
+ * dependency chain where it waits on a blocker.
+ *
+ * A level settles the poll once it holds a task that can start — claimed, or
+ * lost to another process, as before blockers existed. A level where nothing can
+ * start is walked past rather than slept on: a task waiting on its blocker is
+ * one this process can do nothing about, and idling on it would hold up every
+ * level below it.
+ */
 async function pickAndClaim(runOpts: RunOpts): Promise<ClaimOutcome> {
   const { github } = runOpts;
+  const calls: RateLimitCall[] = [];
+  let openPullRequests: Promise<OpenPullRequest[]> | undefined;
+  const pass: PollPass = {
+    decide: (blockedBy) =>
+      decideStart({
+        blockedBy,
+        repoNameWithOwner: runOpts.repoNameWithOwner,
+        baseBranch: runOpts.repoConfig.baseBranch,
+        // Once per poll, and only if some blocker is done: one list answers
+        // every blocker this poll looks up.
+        openPullRequests: () =>
+          (openPullRequests ??= github.fetchOpenPullRequests({ repoNameWithOwner: runOpts.repoNameWithOwner })),
+      }),
+    tried: new Set(),
+    waiting: [],
+  };
 
-  const { candidates, calls } = await github.fetchCandidateTasks({
-    ghOwner: runOpts.ghOwner,
-    ghProject: runOpts.ghProject,
-    repoNameWithOwner: runOpts.repoNameWithOwner,
-  });
-
-  runOpts.mainLogger.info(`rate-limit ${formatRateLimit(calls)}`);
-
-  if (candidates.length === 0) {
-    return { kind: 'empty' };
-  }
-
-  const eligible = withoutCoolingDown(candidates, runOpts.recentlyHandled);
-
-  if (eligible.length === 0) {
-    runOpts.mainLogger.info(
-      `every candidate was handled by this run in the last ${HANDLED_COOLDOWN_MS / 1000}s ` +
-        `(${candidates.map((c) => `#${c.issue.number}`).join(', ')})`
-    );
-
-    return { kind: 'all-cooling' };
-  }
-
-  // Walked in order, not just the first tried and the rest dropped. Losing a
-  // claim costs one call and settles nothing about the next candidate, so a
-  // process that stopped at the first loss would sleep a full poll-pause over a
-  // queue it could have worked — and several processes polling the same project
-  // would converge on the same item every pass and mostly idle.
-  for (const candidate of eligible) {
-    const branch = branchFor(candidate.issue);
-    const won = await claimTask({
-      github,
+  try {
+    for await (const level of github.candidateLevels({
+      ghOwner: runOpts.ghOwner,
+      ghProject: runOpts.ghProject,
+      projectId: runOpts.meta.projectId,
       repoNameWithOwner: runOpts.repoNameWithOwner,
-      branch,
+    })) {
+      calls.push({ priority: level.priority, rateLimit: level.rateLimit });
+
+      if (level.candidates.length === 0) {
+        continue;
+      }
+
+      const eligible = withoutCoolingDown(level.candidates, runOpts.recentlyHandled);
+
+      if (eligible.length === 0) {
+        runOpts.mainLogger.info(
+          `every candidate was handled by this run in the last ${HANDLED_COOLDOWN_MS / 1000}s ` +
+            `(${level.candidates.map((c) => `#${c.issue.number}`).join(', ')})`
+        );
+
+        return { kind: 'all-cooling' };
+      }
+
+      const outcome = await claimFromLevel(runOpts, eligible, pass);
+
+      if (outcome) {
+        return outcome;
+      }
+    }
+  } finally {
+    runOpts.mainLogger.info(`rate-limit ${formatRateLimit(calls)}`);
+  }
+
+  return pass.waiting.length > 0 ? { kind: 'all-blocked', waiting: pass.waiting } : { kind: 'empty' };
+}
+
+/**
+ * Claims the first task of a level that can start, or reports that every one
+ * that could was lost to another process. Null means nothing on the level could
+ * start at all, and the poll moves on to the next.
+ *
+ * Walked in order, not just the first tried and the rest dropped. Losing a claim
+ * costs one call and settles nothing about the next candidate, so a process that
+ * stopped at the first loss would sleep a full poll-pause over a queue it could
+ * have worked — and several processes polling the same project would converge
+ * on the same item every pass and mostly idle.
+ */
+async function claimFromLevel(runOpts: RunOpts, candidates: FoundTask[], pass: PollPass): Promise<ClaimOutcome | null> {
+  let lost = false;
+
+  for (const candidate of candidates) {
+    const target = await resolveTarget(runOpts, candidate, pass);
+
+    if (!target || pass.tried.has(target.task.issue.number)) {
+      continue;
+    }
+
+    pass.tried.add(target.task.issue.number);
+    const won = await claimTask({
+      github: runOpts.github,
+      repoNameWithOwner: runOpts.repoNameWithOwner,
+      branch: branchFor(target.task.issue),
       sha: runOpts.claimSha,
     });
 
     if (!won) {
-      runOpts.mainLogger.info(`claim already held on #${candidate.issue.number} (${claimRefFor(branch)} exists)`);
+      runOpts.mainLogger.info(
+        `claim already held on #${target.task.issue.number} (${claimRefFor(branchFor(target.task.issue))} exists)`
+      );
+      lost = true;
 
       continue;
     }
 
-    runOpts.mainLogger.info(`claim won: #${candidate.issue.number} by ${runOpts.runId}`, TERMINAL);
+    runOpts.mainLogger.info(`claim won: #${target.task.issue.number} by ${runOpts.runId}`, TERMINAL);
     // The board's copy of who is working this, and nothing more — see `BOT_FIELD`.
     // Best-effort on purpose: the claim is already held by the time this runs, so
     // a failure here costs a label on a card and no correctness at all.
-    await markBotField(runOpts, candidate);
+    await markBotField(runOpts, target.task);
     // Immediately, rather than once the worktree is ready. An item that is claimed
     // but still reads as Todo is one every other process keeps picking up and
     // losing the ref race on, and worktree prep and seeding can take minutes on a
     // cold checkout. Moving it here shrinks that window to a single mutation.
-    await moveStatus(runOpts, candidate, {
+    await moveStatus(runOpts, target.task, {
       optionId: runOpts.meta.statusOptionInProgressId,
       name: STATUS_VALUES.inProgress,
     });
 
-    return { kind: 'won', task: candidate, calls };
+    return { kind: 'won', task: target.task, start: target.start };
   }
 
-  return { kind: 'all-lost' };
+  return lost ? { kind: 'all-lost' } : null;
+}
+
+/**
+ * The task a candidate stands for, and where it starts from: the candidate
+ * itself where it can start, the head of its dependency chain where it waits on
+ * a blocker and the head is a task ramonda can work — or nothing, where the
+ * candidate waits, is skipped, or is cancelled here and now.
+ */
+async function resolveTarget(
+  runOpts: RunOpts,
+  candidate: FoundTask,
+  pass: PollPass
+): Promise<{ task: FoundTask; start: TaskStart } | null> {
+  const n = candidate.issue.number;
+  const decision = await pass.decide(candidate.blockedBy);
+
+  switch (decision.kind) {
+    case 'start':
+      return { task: candidate, start: decision.start };
+    case 'skip':
+      runOpts.mainLogger.info(`skipping #${n}: ${decision.reason}`);
+      pass.waiting.push(n);
+
+      return null;
+    case 'cancel':
+      await cancelUnstartable(runOpts, candidate, decision.reason);
+
+      return null;
+    case 'wait':
+      break;
+  }
+
+  const chain = await followChain({
+    from: n,
+    blocker: decision.blocker,
+    fetchIssue: (number) =>
+      runOpts.github.fetchChainIssue({
+        repoNameWithOwner: runOpts.repoNameWithOwner,
+        number,
+        projectId: runOpts.meta.projectId,
+      }),
+    decide: pass.decide,
+  });
+
+  if (chain.kind === 'none') {
+    runOpts.mainLogger.info(`#${n} ${chain.reason}`);
+    pass.waiting.push(n);
+
+    return null;
+  }
+
+  const root = chain.issue;
+
+  // Cooling like any candidate would be — see `HANDLED_COOLDOWN_MS`. The head of
+  // a chain this run just finished can read as `Todo` for a moment longer. The
+  // map was pruned when this level was filtered, so what it holds is current.
+  if (runOpts.recentlyHandled.has(root.number)) {
+    pass.waiting.push(n);
+
+    return null;
+  }
+
+  runOpts.mainLogger.info(
+    `#${n} waits on #${decision.blocker.number} — working #${root.number} first, at the head of its chain`,
+    TERMINAL
+  );
+
+  return {
+    task: {
+      itemId: root.itemId,
+      issue: { number: root.number, title: root.title, body: root.body },
+      priorityHit: `${candidate.priorityHit} via #${n}`,
+      blockedBy: root.blockedBy,
+    },
+    start: chain.start,
+  };
+}
+
+/**
+ * Cancels a candidate whose dependency will not resolve on its own, before any
+ * worktree exists for it: claimed first, so that two processes reaching it in
+ * the same poll comment once between them.
+ *
+ * Counts against nothing. The no-PR budget is there to stop a run that burns
+ * sessions, and this costs none — while counting it would let three misconfigured
+ * cards end an overnight run.
+ */
+async function cancelUnstartable(runOpts: RunOpts, task: FoundTask, reason: string): Promise<void> {
+  const branch = branchFor(task.issue);
+  const won = await claimTask({
+    github: runOpts.github,
+    repoNameWithOwner: runOpts.repoNameWithOwner,
+    branch,
+    sha: runOpts.claimSha,
+  });
+
+  if (!won) {
+    runOpts.mainLogger.info(`claim already held on #${task.issue.number} (${claimRefFor(branch)} exists)`);
+
+    return;
+  }
+
+  await cancelClaimed({ opts: runOpts, task, branch, reason });
+}
+
+/**
+ * Takes a claimed task off the board as `Cancelled`, with the reason on the
+ * issue, without a task state to record it in — the one cancel that happens
+ * before a session could have. Every write is best-effort, as the Cancel path's are.
+ */
+async function cancelClaimed(args: { opts: RunOpts; task: FoundTask; branch: string; reason: string }): Promise<void> {
+  const { opts, task, branch, reason } = args;
+
+  await moveStatus(opts, task, { optionId: opts.meta.statusOptionCancelledId, name: STATUS_VALUES.cancelled });
+
+  try {
+    await opts.github.postIssueComment({
+      repoNameWithOwner: opts.repoNameWithOwner,
+      issueNumber: task.issue.number,
+      body: `Cancelled by ramonda (${new Date().toISOString()}): ${reason}`,
+    });
+  } catch (err) {
+    opts.mainLogger.info(`warning: could not comment on #${task.issue.number}: ${(err as Error).message}`, TERMINAL);
+  }
+
+  await releaseClaim({ opts, task, branch, note: 'after cancelling it before pickup', revertToTodo: false });
+  // The status move lags the filter like any other — see `HANDLED_COOLDOWN_MS` —
+  // and a second cancel would mean a second comment.
+  opts.recentlyHandled.set(task.issue.number, Date.now());
+  opts.mainLogger.info(`task #${task.issue.number} cancelled — ${reason}`, TERMINAL);
 }
 
 /**
@@ -210,7 +413,11 @@ export async function runOneTask(opts: RunOpts): Promise<TaskOutcome> {
     return { kind: 'idle-cooling' };
   }
 
-  const task = claimed.task;
+  if (claimed.kind === 'all-blocked') {
+    return { kind: 'idle-blocked', waiting: claimed.waiting };
+  }
+
+  const { task, start } = claimed;
   const git = new Git(opts.workspacePath, { ghToken: opts.ghToken, commitIdentity: opts.commitIdentity });
   const issueTitleSlug = slugify(task.issue.title);
   // The same name the claim ref was taken under — one derivation, so the ref
@@ -224,8 +431,16 @@ export async function runOneTask(opts: RunOpts): Promise<TaskOutcome> {
   });
 
   try {
-    return await runClaimedTask({ opts, task, git, branch, issueTitleSlug, worktreePath });
+    return await runClaimedTask({ opts, task, start, git, branch, issueTitleSlug, worktreePath });
   } catch (err) {
+    // Thrown ahead of the task state write, so the claim and the In progress move
+    // are all this pickup took — and the cancel puts both back its own way.
+    if (err instanceof StartCancelled) {
+      await cancelClaimed({ opts, task, branch, reason: err.message });
+
+      return { kind: 'unstartable', issueNumber: task.issue.number };
+    }
+
     // Not a failure: the operator asked to stop, and stopping before a session
     // exists is the cheapest place to do it. Both checkpoints sit ahead of the
     // task state write, so there is no project state here beyond the claim.
@@ -377,12 +592,13 @@ async function releaseClaim(args: {
 async function runClaimedTask(args: {
   opts: RunOpts;
   task: FoundTask;
+  start: TaskStart;
   git: Git;
   branch: string;
   issueTitleSlug: string;
   worktreePath: string;
 }): Promise<TaskOutcome> {
-  const { opts, task, git, branch, issueTitleSlug, worktreePath } = args;
+  const { opts, task, start, git, branch, issueTitleSlug, worktreePath } = args;
 
   // Pickup is seconds of git and network work before there is any child to
   // signal, so a stop arriving inside it has to be read rather than delivered.
@@ -398,7 +614,7 @@ async function runClaimedTask(args: {
   const taskLog = createLogger(taskLogFile);
 
   try {
-    return await runTaskSession({ opts, task, git, branch, worktreePath, taskLogFile, taskLog });
+    return await runTaskSession({ opts, task, start, git, branch, worktreePath, taskLogFile, taskLog });
   } finally {
     await closeLogger(taskLog);
   }
@@ -407,23 +623,29 @@ async function runClaimedTask(args: {
 async function runTaskSession(args: {
   opts: RunOpts;
   task: FoundTask;
+  start: TaskStart;
   git: Git;
   branch: string;
   worktreePath: string;
   taskLogFile: string;
   taskLog: winston.Logger;
 }): Promise<TaskOutcome> {
-  const { opts, task, git, branch, worktreePath, taskLogFile, taskLog } = args;
+  const { opts, task, start, git, branch, worktreePath, taskLogFile, taskLog } = args;
+  const stacked = start.stackedOn ? ` stacked on #${start.blocker?.number} (${start.stackedOn.branch})` : '';
 
-  opts.mainLogger.info(`pickup #${task.issue.number} ${task.issue.title} [priority=${task.priorityHit}]`, TERMINAL);
-  opts.mainLogger.info(`branch=${branch} worktree=${worktreePath} log=${taskLogFile}`);
+  opts.mainLogger.info(
+    `pickup #${task.issue.number} ${task.issue.title} [priority=${task.priorityHit}]${stacked}`,
+    TERMINAL
+  );
+  opts.mainLogger.info(`branch=${branch} base=${start.baseBranch} worktree=${worktreePath} log=${taskLogFile}`);
 
-  taskLog.info(`task pickup: #${task.issue.number} "${task.issue.title}" priority=${task.priorityHit}`);
-  taskLog.info(`branch=${branch} base=${opts.repoConfig.baseBranch} worktree=${worktreePath}`);
+  taskLog.info(`task pickup: #${task.issue.number} "${task.issue.title}" priority=${task.priorityHit}${stacked}`);
+  taskLog.info(`branch=${branch} base=${start.baseBranch} worktree=${worktreePath}`);
 
   const { brief, taskState } = await prepareTask({
     opts,
     task,
+    start,
     git,
     branch,
     worktreePath,

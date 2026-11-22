@@ -14,11 +14,13 @@ import {
 } from '../constants/github.js';
 import {
   PROJECT_SHAPE_QUERY,
+  CHAIN_ISSUE_QUERY,
   CLEAR_ITEM_FIELD_MUTATION,
   CREATE_PROJECT_MUTATION,
   CREATE_SELECT_FIELD_MUTATION,
   CREATE_TEXT_FIELD_MUTATION,
   DELETE_PROJECT_WORKFLOW_MUTATION,
+  OPEN_PULL_REQUESTS_QUERY,
   OWNER_ID_QUERY,
   PROJECT_ITEMS_QUERY,
   PROJECT_META_QUERY,
@@ -30,16 +32,21 @@ import {
   UPDATE_SELECT_FIELD_MUTATION,
 } from '../constants/github-graphql.js';
 import type {
+  Blocker,
+  Blockers,
+  ChainIssue,
   CommitIdentity,
   FoundTask,
   NewOption,
+  OpenPullRequest,
   ProjectField,
   ProjectMeta,
   ProjectShape,
   ProjectWorkflow,
-  RateLimitCall,
   RateLimitHeaders,
   RateLimitObservation,
+  RawBlockedBy,
+  RawBlocker,
   SelectOption,
   TaskNode,
   TokenProbe,
@@ -380,7 +387,7 @@ function oldestFirst(candidates: FoundTask[]): FoundTask[] {
 }
 
 /** Project items also carry pull requests and draft issues; only issues are tasks. */
-function nodeToTask(node: TaskNode, priority: string): FoundTask | null {
+function nodeToTask(node: TaskNode, priority: string, projectId: string): FoundTask | null {
   const { content } = node;
 
   if (content.__typename !== 'Issue' || content.number === undefined) {
@@ -395,6 +402,29 @@ function nodeToTask(node: TaskNode, priority: string): FoundTask | null {
       body: content.body ?? '',
     },
     priorityHit: priority,
+    blockedBy: toBlockers(content.blockedBy, projectId),
+  };
+}
+
+/** A blocker with its item and `Status` on `projectId` picked out of every project it is on. */
+function toBlocker(raw: RawBlocker, projectId: string): Blocker {
+  const item = raw.projectItems.nodes.find((node) => node?.project.id === projectId);
+
+  return {
+    number: raw.number,
+    title: raw.title,
+    state: raw.state,
+    stateReason: raw.stateReason,
+    repoNameWithOwner: raw.repository.nameWithOwner,
+    itemId: item?.id,
+    status: item?.fieldValueByName?.name,
+  };
+}
+
+function toBlockers(raw: RawBlockedBy | undefined, projectId: string): Blockers {
+  return {
+    totalCount: raw?.totalCount ?? 0,
+    blockers: (raw?.nodes ?? []).filter((node) => node !== null).map((node) => toBlocker(node, projectId)),
   };
 }
 
@@ -663,27 +693,36 @@ export class Github {
       number: opts.ghProject,
       q: opts.filter,
       first: opts.first,
+      statusField: STATUS_FIELD,
     });
 
     return { nodes: requireProject(data, opts).items.nodes, rateLimit };
   }
 
-  async fetchCandidateTasks(opts: {
+  /**
+   * The candidates one poll considers, a priority level at a time, highest first
+   * — and then the issues carrying no level at all.
+   *
+   * That last pass is what keeps a queue moving that nobody has triaged. Every
+   * other pass filters on a value, so an issue left without one matched no query
+   * ramonda made: labelled, in `Todo`, and invisible for as long as it sat there,
+   * with `no eligible tasks` the only thing said about it. It comes last because a
+   * stated priority outranks an unstated one, whichever the level.
+   *
+   * Handed out a level at a time, empty ones included, and queried only as the
+   * caller asks for the next: whether a level settles the poll is the caller's
+   * to decide — a level whose every issue waits on a blocker is one it walks past
+   * — and each level it never reaches is a query never made.
+   */
+  async *candidateLevels(opts: {
     ghOwner: string;
     ghProject: number;
+    /** The project whose `Status` a blocker is read on. */
+    projectId: string;
     repoNameWithOwner: string;
-  }): Promise<{ candidates: FoundTask[]; calls: RateLimitCall[] }> {
+  }): AsyncGenerator<{ priority: string; candidates: FoundTask[]; rateLimit: RateLimitHeaders }> {
     const base = buildBaseFilter({ repoNameWithOwner: opts.repoNameWithOwner });
     const priorityQ = PRIORITY_FIELD.toLowerCase();
-    const calls: RateLimitCall[] = [];
-    // One pass per level, highest first, taking the first that yields an issue —
-    // and then one for the issues carrying no level at all.
-    //
-    // That last pass is what keeps a queue moving that nobody has triaged. Every
-    // other pass filters on a value, so an issue left without one matched no
-    // query ramonda made: labelled, in `Todo`, and invisible for as long as it sat
-    // there, with `no eligible tasks` the only thing said about it. It comes last
-    // because a stated priority outranks an unstated one, whichever the level.
     const passes: Array<{ priority: string; filter: string }> = [
       ...PRIORITY_VALUES.map((priority) => ({
         priority: priority as string,
@@ -699,19 +738,67 @@ export class Github {
         filter: pass.filter,
         first: CANDIDATE_BATCH,
       });
-      calls.push({ priority: pass.priority, rateLimit });
+      const candidates = nodes
+        .map((node) => nodeToTask(node, pass.priority, opts.projectId))
+        .filter((task) => task !== null);
 
-      const candidates = nodes.map((node) => nodeToTask(node, pass.priority)).filter((task) => task !== null);
+      yield {
+        priority: pass.priority,
+        candidates: pass.priority === NO_PRIORITY ? oldestFirst(candidates) : candidates,
+        rateLimit,
+      };
+    }
+  }
 
-      if (candidates.length > 0) {
-        return {
-          candidates: pass.priority === NO_PRIORITY ? oldestFirst(candidates) : candidates,
-          calls,
-        };
-      }
+  /**
+   * One issue of this repo, as a link in a dependency chain — null where the
+   * repo holds no such issue, one transferred away or deleted since it was linked.
+   */
+  async fetchChainIssue(opts: {
+    repoNameWithOwner: string;
+    number: number;
+    /** The project whose `Status` the issue and its blockers are read on. */
+    projectId: string;
+  }): Promise<ChainIssue | null> {
+    const { owner, repo } = splitRepo(opts.repoNameWithOwner);
+    const data = await this.#octokit.graphql<{
+      repository: {
+        issue:
+          (RawBlocker & { body: string; labels: { nodes: Array<{ name: string }> }; blockedBy: RawBlockedBy }) | null;
+      } | null;
+    }>(CHAIN_ISSUE_QUERY, { owner, name: repo, number: opts.number, statusField: STATUS_FIELD });
+    const issue = data.repository?.issue;
+
+    if (!issue) {
+      return null;
     }
 
-    return { candidates: [], calls };
+    return {
+      ...toBlocker(issue, opts.projectId),
+      body: issue.body,
+      labels: issue.labels.nodes.map((label) => label.name),
+      blockedBy: toBlockers(issue.blockedBy, opts.projectId),
+    };
+  }
+
+  /** The repo's open pull requests, first 100 — where a blocker's branch is looked up. */
+  async fetchOpenPullRequests(opts: { repoNameWithOwner: string }): Promise<OpenPullRequest[]> {
+    const { owner, repo } = splitRepo(opts.repoNameWithOwner);
+    const data = await this.#octokit.graphql<{
+      repository: {
+        pullRequests: {
+          nodes: Array<{ url: string; headRefName: string; headRepository: { nameWithOwner: string } | null } | null>;
+        };
+      } | null;
+    }>(OPEN_PULL_REQUESTS_QUERY, { owner, name: repo });
+
+    return (data.repository?.pullRequests.nodes ?? [])
+      .filter((pr) => pr !== null)
+      .map((pr) => ({
+        url: pr.url,
+        headRefName: pr.headRefName,
+        headRepoNameWithOwner: pr.headRepository?.nameWithOwner,
+      }));
   }
 
   /**

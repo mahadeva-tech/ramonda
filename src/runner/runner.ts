@@ -83,6 +83,13 @@ export type TaskOutcome =
   | { kind: 'idle-all-claimed' }
   /** Every candidate was one this run just finished with — see `HANDLED_COOLDOWN_MS`. */
   | { kind: 'idle-cooling' }
+  /** Every candidate waits on a blocker, at every level. */
+  | { kind: 'idle-blocked'; waiting: number[] }
+  /**
+   * A claimed task that turned out unable to start, cancelled before its session
+   * — see `StartCancelled`. No session ran, so nothing is counted.
+   */
+  | { kind: 'unstartable'; issueNumber: number }
   | { kind: 'aborted' }
   | { kind: 'stop' };
 
@@ -480,11 +487,17 @@ export async function run(opts: {
 
       // `aborted` only happens under a stop request, which the loop condition
       // has already seen — it re-polls for exactly as long as it takes to exit.
-      if (outcome.kind === 'ran' || outcome.kind === 'aborted') {
+      if (outcome.kind === 'ran' || outcome.kind === 'unstartable' || outcome.kind === 'aborted') {
         continue;
       }
 
-      if (outcome.kind === 'idle-all-claimed') {
+      if (outcome.kind === 'idle-blocked') {
+        mainLogger.info(
+          `only tasks waiting on blockers in ${repoNameWithOwner} ` +
+            `(${outcome.waiting.map((n) => `#${n}`).join(', ')}; the log says on what) — sleeping ${opts.pollPauseSeconds}s`,
+          TERMINAL
+        );
+      } else if (outcome.kind === 'idle-all-claimed') {
         mainLogger.info(
           `candidate claimed elsewhere in ${repoNameWithOwner} — sleeping ${opts.pollPauseSeconds}s before re-poll`,
           TERMINAL

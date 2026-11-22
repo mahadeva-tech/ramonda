@@ -36,6 +36,8 @@ Text in backticks is verbatim: a flag, a file path, a command line, a key or a m
 - **the claim guard**: the unwinding in Requirement 19.
 - **the Cancel path**: the sequence in Requirement 27.
 - **the no-PR budget**: the limit in Requirement 28.
+- **blocker**: the issue another issue is blocked by, through Github's `Blocked by` issue relationship (Requirement 31).
+- **done**: a blocker whose `Status` is `Ready for review` or a column after it.
 
 ## Requirements
 
@@ -230,7 +232,7 @@ Text in backticks is verbatim: a flag, a file path, a command line, a key or a m
 3. If `ramonda.json` is not a valid JSON object, then the command shall refuse, naming the file.
 4. If a required key is missing or holds the wrong shape, then the command shall refuse, naming the file and the key.
 5. Ramonda shall require every key, except `timeout` on a `worktree.prepare` or `verify` entry.
-6. Ramonda shall require `baseBranch` to be a non-empty string, cut every task branch from `origin/<baseBranch>`, and target every pull request at `<baseBranch>`.
+6. Ramonda shall require `baseBranch` to be a non-empty string, cut every task branch from `origin/<baseBranch>`, and target every pull request at `<baseBranch>`, except for a task stacked on its blocker's branch as Requirement 31 specifies.
 7. Ramonda shall require `project.owner` to be a string and `project.number` a non-negative integer, naming the project the repository's tasks live on, and holding `""` and `0` until `setup-project` records it.
 8. Ramonda shall require `worktree.filesToCopy` to be an array, possibly empty, of paths relative to the repository root, naming the gitignored files a task's worktree needs copied from the base checkout.
 9. Ramonda shall require `worktree.prepare` to be an array, possibly empty, of `{ "command", "timeout" }` entries, run in order in a task's worktree before its session starts.
@@ -352,8 +354,8 @@ Text in backticks is verbatim: a flag, a file path, a command line, a key or a m
 #### Acceptance Criteria
 
 1. When a pass starts, `run` shall query the project for the open issues of this repository that carry the `ramonda` label and the `Status` `Todo`.
-2. `run` shall query one `Priority` level at a time, `Critical` first and `Low` last, and take the first level that yields an issue, in the project's own order.
-3. When no level yields an issue, `run` shall query the issues carrying no `Priority`, and take them oldest first.
+2. `run` shall query one `Priority` level at a time, `Critical` first and `Low` last, and take the first level that yields an issue that can start as Requirement 31 decides, in the project's own order.
+3. When no level yields an issue that can start, `run` shall query the issues carrying no `Priority`, and take them oldest first.
 4. `run` shall ignore project items that are not issues.
 5. `run` shall skip an issue this process finished with in the last 10 seconds.
 6. When a pass finds no issue to work, `run` shall wait the poll pause and poll again.
@@ -386,7 +388,7 @@ Text in backticks is verbatim: a flag, a file path, a command line, a key or a m
 
 1. When a claim is won, `run` shall run `git fetch origin` in the base checkout.
 2. `run` shall not check out a branch, touch the index, or change a file of the base checkout outside `.worktrees/`.
-3. While the worktree does not exist, `run` shall add it on `<branch>`, creating the branch from `origin/<baseBranch>` where it does not exist locally.
+3. While the worktree does not exist, `run` shall add it on `<branch>`, creating the branch from `origin/<base>` where it does not exist locally, `<base>` being the branch Requirement 31 settles.
 4. While the worktree exists, `run` shall reuse it on `<branch>`, keeping its commits and ignored files and discarding every other uncommitted change.
 5. When a reused worktree held uncommitted changes, `run` shall log what it discarded.
 6. If the worktree path exists but is not a git worktree, then `run` shall fail the pass.
@@ -404,10 +406,11 @@ Text in backticks is verbatim: a flag, a file path, a command line, a key or a m
 #### Acceptance Criteria
 
 1. When the worktree is seeded, `run` shall write `<worktreePath>/.claude/AGENT_TASK.md` holding the issue title and number, the branch, the issue body or `(no description provided)`, instructions to implement the task on the branch and to stop when done so that the Stop hook can verify it, and `Closes #<issue-#>`.
-2. `run` shall give the session the text of `AGENT_TASK.md` as its prompt.
-3. `run` shall install its Stop and StopFailure hooks in `<worktreePath>/.claude/settings.local.json`, replacing the entries an earlier task installed and keeping every other setting.
-4. `run` shall write the task state with a fresh session ID, the task's issue, branch and repository, the project IDs the Cancel path and publishing need, and a verify failure count of zero, and with no credential.
-5. `run` shall start the session in the worktree with stdin detached, `<bin>` being `CLAUDE_BIN`, or `claude` where it is unset:
+2. Where the task is stacked on its blocker's branch, `AGENT_TASK.md` shall also hold a `Builds on` section naming the blocker's number and title, its pull request's URL and its branch, and saying that the branch was cut from it.
+3. `run` shall give the session the text of `AGENT_TASK.md` as its prompt.
+4. `run` shall install its Stop and StopFailure hooks in `<worktreePath>/.claude/settings.local.json`, replacing the entries an earlier task installed and keeping every other setting.
+5. `run` shall write the task state with a fresh session ID, the task's issue, branch and repository, the project IDs the Cancel path and publishing need, and a verify failure count of zero, and with no credential.
+6. `run` shall start the session in the worktree with stdin detached, `<bin>` being `CLAUDE_BIN`, or `claude` where it is unset:
 
    ```
    <bin> --session-id <claudeSessionId> \
@@ -417,7 +420,7 @@ Text in backticks is verbatim: a flag, a file path, a command line, a key or a m
          --print "<task-brief-text>"
    ```
 
-6. `run` shall start the session with the credentials removed from its environment as Requirement 6 specifies, and with `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME` and `GIT_COMMITTER_EMAIL` set to the account of Requirement 26.
+7. `run` shall start the session with the credentials removed from its environment as Requirement 6 specifies, and with `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME` and `GIT_COMMITTER_EMAIL` set to the account of Requirement 26.
 
 ### Requirement 22: Session verdicts
 
@@ -459,7 +462,7 @@ Text in backticks is verbatim: a flag, a file path, a command line, a key or a m
 3. While the task state is missing, or carries `completedAt`, `cancelledAt` or `verifyPassedAt`, the Stop hook shall do nothing.
 4. If a `verify` command fails or times out for the first or second time on the task, then the Stop hook shall block the stop, handing the model the command, how it failed, its output and the failure count.
 5. If a `verify` command fails or times out for the third time on the task, then the Stop hook shall record `verifyGaveUp` with the command's output and let the session end.
-6. When every `verify` command passes, the Stop hook shall record `emptyDiff` where the worktree holds no uncommitted change and no commit beyond the base branch, and `verifyPassedAt` otherwise.
+6. When every `verify` command passes, the Stop hook shall record `emptyDiff` where the worktree holds no uncommitted change and no commit beyond the branch the task was cut from, and `verifyPassedAt` otherwise.
 7. While `verify` is empty, the Stop hook shall pass.
 8. If the Stop hook fails for any other reason, then it shall record a non-fatal `sessionError` of type `hook_failed` and exit with status 1.
 9. The Stop hook shall write nothing to stdout but its block decision.
@@ -488,7 +491,7 @@ Text in backticks is verbatim: a flag, a file path, a command line, a key or a m
 4. While the worktree holds uncommitted changes, `run` shall commit them with the issue title as the subject, cut to 72 characters, and `Closes #<issue-#>` in the body.
 5. While the worktree holds no uncommitted change, `run` shall publish the commits the session made.
 6. `run` shall push `<branch>` to `origin`, authenticating an HTTPS push with `GH_TOKEN` without putting the token on the command line.
-7. `run` shall open a pull request from `<branch>` into `<baseBranch>`, titled with the issue title, its body `Closes #<issue-#>` followed by the `verify` commands that passed.
+7. `run` shall open a pull request from `<branch>` into `<base>`, the branch Requirement 31 settles, titled with the issue title, its body `Closes #<issue-#>` followed by the `verify` commands that passed.
 8. If a pull request from `<branch>` is already open, then `run` shall use it.
 9. When the pull request is open, `run` shall move the item to `Ready for review`, best-effort, re-applying the move where a project workflow overwrites it, up to three attempts.
 10. If the move does not stay, then `run` shall warn.
@@ -530,6 +533,7 @@ Text in backticks is verbatim: a flag, a file path, a command line, a key or a m
 3. When a task opens a pull request, `run` shall reset that count.
 4. If the worktree's `.gitignore` check of Requirement 20 fails, then `run` shall end the run on the first failure without counting it.
 5. While a stop is requested, when a task ends without an error, `run` shall not count it.
+6. `run` shall not count a task cancelled before its session over its dependency, as Requirement 31 specifies.
 
 ### Requirement 29: Stopping
 
@@ -551,3 +555,26 @@ Text in backticks is verbatim: a flag, a file path, a command line, a key or a m
 1. Ramonda shall slug an issue title by lowercasing it, replacing every run of characters outside `a-z` and `0-9` with `-`, trimming `-` from both ends, and cutting it to 50 characters with no trailing `-`.
 2. If a title yields an empty slug, then Ramonda shall use `task`.
 3. Ramonda shall name a task's branch, its worktree directory, its task log and its claim ref after `<issue-#>-<slug>`.
+
+### Requirement 31: Dependencies
+
+**User Story:** As a user, I want an issue blocked by another to start only once its blocker is up for review, on a branch cut from the blocker's, so that dependent work is built on the work it depends on and reviewed as its own diff.
+
+#### Acceptance Criteria
+
+1. `run` shall read an issue's blockers from Github's `Blocked by` relationship, in the same query that finds the issue.
+2. `run` shall decide whether an issue can start once, at pickup, and nothing that happens to its blocker afterwards shall change a task that has started.
+3. While an issue has no blocker, `run` shall cut its branch from `origin/<baseBranch>` and target its pull request at `<baseBranch>`.
+4. If an issue has more than one blocker, then `run` shall claim it, move it to `Cancelled`, comment `Cancelled by ramonda (<timestamp>): <reason>` naming the blockers, and release the claim, without starting a session.
+5. If an issue's blocker is in another repository, then `run` shall skip the issue, leaving it in `Todo`.
+6. While an issue's blocker is not done, `run` shall leave the issue in `Todo` and follow the chain of blockers back from it, as criterion 12 specifies.
+7. `run` shall find a done blocker's branch among the repository's open pull requests, as the one whose head branch is in this repository and starts with `<blocker-#>-`.
+8. When a done blocker has exactly one such pull request, `run` shall cut the issue's branch from `origin/<that branch>`, target its pull request at that branch, and measure the session's work against it.
+9. When a done blocker has no such pull request and is closed as completed, `run` shall cut the issue's branch from `origin/<baseBranch>` and target its pull request at `<baseBranch>`.
+10. If a done blocker has more than one such pull request, or none while it is open or closed for any reason other than completed, then `run` shall cancel the issue as criterion 4 specifies, saying why.
+11. `run` shall not count an issue cancelled before its session against the no-PR budget.
+12. While an issue waits on a blocker that is not done, `run` shall follow its blockers back, one link at a time, to the first that can start, and work that one in the issue's place where it is open, carries the `ramonda` label and is in `Todo` on the project, whatever its `Priority`.
+13. If the chain loops, runs longer than 10 links, or ends on an issue `run` cannot work, then `run` shall leave the waiting issue in `Todo`, logging what it waits on.
+14. When no issue of a level can start, `run` shall query the next level.
+15. When an issue with a blocker is picked up on a branch kept from an earlier attempt, `run` shall merge `origin/<base>` into it before the session, `<base>` being the branch criteria 8 and 9 settle.
+16. If that merge does not apply cleanly, then `run` shall abort it, and cancel the issue as criterion 4 specifies, saying to resolve the conflict by hand.

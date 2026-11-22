@@ -40,9 +40,48 @@ export const PROJECT_META_QUERY = /* GraphQL */ `
   }
 `;
 
-/** Project items matching a filter, narrowed to the issues ramonda can pick up. */
+/**
+ * What is read about an issue blocking another: enough for `decideStart` to
+ * settle, without a call of its own, whether the issue it blocks can start.
+ *
+ * The status comes back for every project the issue is on, because an issue's
+ * items cannot be narrowed to one project in the query — the caller keeps the
+ * one on its own board. Every document spreading this declares `$statusField`.
+ */
+const BLOCKER_FIELDS = /* GraphQL */ `
+  fragment BlockerFields on Issue {
+    number
+    title
+    state
+    stateReason
+    repository {
+      nameWithOwner
+    }
+    projectItems(first: 20) {
+      nodes {
+        id
+        project {
+          id
+        }
+        fieldValueByName(name: $statusField) {
+          ... on ProjectV2ItemFieldSingleSelectValue {
+            name
+          }
+        }
+      }
+    }
+  }
+`;
+
+/**
+ * Project items matching a filter, narrowed to the issues ramonda can pick up,
+ * each with the issues blocking it.
+ *
+ * Two blockers rather than all of them: a task may have one, so two is what
+ * tells "one" from "too many", and `totalCount` says how many there really are.
+ */
 export const PROJECT_ITEMS_QUERY = /* GraphQL */ `
-  query ($login: String!, $number: Int!, $q: String!, $first: Int!) {
+  query ($login: String!, $number: Int!, $q: String!, $first: Int!, $statusField: String!) {
     repositoryOwner(login: $login) {
       ... on ProjectV2Owner {
         projectV2(number: $number) {
@@ -55,9 +94,67 @@ export const PROJECT_ITEMS_QUERY = /* GraphQL */ `
                   number
                   title
                   body
+                  blockedBy(first: 2) {
+                    totalCount
+                    nodes {
+                      ...BlockerFields
+                    }
+                  }
                 }
               }
             }
+          }
+        }
+      }
+    }
+  }
+  ${BLOCKER_FIELDS}
+`;
+
+/**
+ * One issue, read while following a dependency chain back from a task that
+ * waits on it: what it is blocked by in turn, and whether it is a task ramonda
+ * could work itself.
+ */
+export const CHAIN_ISSUE_QUERY = /* GraphQL */ `
+  query ($owner: String!, $name: String!, $number: Int!, $statusField: String!) {
+    repository(owner: $owner, name: $name) {
+      issue(number: $number) {
+        ...BlockerFields
+        body
+        labels(first: 100) {
+          nodes {
+            name
+          }
+        }
+        blockedBy(first: 2) {
+          totalCount
+          nodes {
+            ...BlockerFields
+          }
+        }
+      }
+    }
+  }
+  ${BLOCKER_FIELDS}
+`;
+
+/**
+ * The repo's open pull requests, which is where a blocker's branch is found.
+ *
+ * Not through the blocker's own linked pull requests: Github links a `Closes #N`
+ * only on a PR targeting the default branch, so a PR stacked on another task's
+ * branch is linked to nothing — and the chain would break at its second link.
+ */
+export const OPEN_PULL_REQUESTS_QUERY = /* GraphQL */ `
+  query ($owner: String!, $name: String!) {
+    repository(owner: $owner, name: $name) {
+      pullRequests(states: OPEN, first: 100) {
+        nodes {
+          url
+          headRefName
+          headRepository {
+            nameWithOwner
           }
         }
       }

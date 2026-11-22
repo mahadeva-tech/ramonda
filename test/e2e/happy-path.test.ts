@@ -3,14 +3,16 @@
 // Creates a throwaway Github repo on the fly, seeds it from the
 // `test/test-repo/` fixture, builds its project by running the real
 // `ramonda setup-project`, then runs the real `ramonda` CLI against the real
-// `claude` binary. Ends when both PRs are opened and both issues' project
+// `claude` binary. Ends when every PR is opened and every issue's project
 // status flips to the configured in-review value. Cleans up (deletes repo +
 // project) only on success.
 //
-// Two tasks rather than one, worked back to back by a single run: a second
+// Several tasks rather than one, worked back to back by a single run: a second
 // `Todo` item is the only thing that covers the loop coming back for the next
 // one — off a base branch it has already synced, with the previous task's PR
-// still open — which one task can say nothing about.
+// still open — which one task can say nothing about. The third is blocked by
+// the second, which covers a task waiting on its blocker and then stacking on
+// its branch.
 //
 // Completion is detected from ramonda's own stdout, not by polling the project —
 // see `waitForNextCompletion`. Github is read only to assert the outcome.
@@ -73,6 +75,12 @@ type E2eTaskDef = {
    * that carry none — so this is what decides which of the two finds the issue.
    */
   priority?: string;
+  /**
+   * The `TASKS` index of the task blocking this one, through Github's `Blocked by`
+   * relationship — so this one waits for it, is cut from its branch, and opens
+   * its PR against that branch.
+   */
+  blockedBy?: number;
   /** Patterns `index.js` on this task's PR branch must carry. */
   expected: RegExp[];
   /** Patterns it must no longer carry. */
@@ -115,10 +123,22 @@ const TASKS: E2eTaskDef[] = [
     expected: [/app\.get\(\s*['"]\/goodbye['"]/, /Goodbye, world!/, /app\.get\(\s*['"]\/hello['"]/],
     absent: [],
   },
+  {
+    title: 'Add /bye endpoint',
+    body: `Add 'GET /bye' endpoint which returns "Bye, world!"`,
+    // Blocked by `/goodbye`, and untriaged like it, so the no-priority pass finds
+    // both and works them oldest first: the blocker, then this one — stacked on
+    // the blocker's branch, which is the one place `/goodbye` exists while its
+    // PR is still open. Finding it here is what proves the branch was cut from
+    // there rather than from main.
+    blockedBy: 1,
+    expected: [/app\.get\(\s*['"]\/bye['"]/, /Bye, world!/, /app\.get\(\s*['"]\/goodbye['"]/],
+    absent: [],
+  },
 ];
 
 // Pinned so a run's cost and behaviour don't drift with whatever the local
-// `claude` binary defaults to. Both fixture tasks are a handful of lines, well
+// `claude` binary defaults to. Every fixture task is a handful of lines, well
 // within Sonnet's reach.
 const MODEL = process.env.RAMONDA_E2E_MODEL ?? 'claude-sonnet-5';
 
@@ -128,6 +148,8 @@ type E2eTask = E2eTaskDef & {
   itemId: string;
   slug: string;
   branch: string;
+  /** The branch this task's PR targets: its blocker's, or main. */
+  base: string;
 };
 
 type E2eCtx = {
@@ -351,6 +373,7 @@ async function setup(): Promise<E2eCtx> {
         todoOptionId,
         priorityFieldId: priorityField.id,
         priorityOptionId: def.priority === undefined ? undefined : requireOption(priorityField, def.priority),
+        blocker: def.blockedBy === undefined ? undefined : tasks[def.blockedBy],
       })
     );
   }
@@ -386,8 +409,10 @@ async function seedTask(args: {
   priorityFieldId: string;
   /** Undefined leaves the item with no level, for the `no:priority` pass to find. */
   priorityOptionId?: string;
+  /** The already-seeded task blocking this one, if any. */
+  blocker?: E2eTask;
 }): Promise<E2eTask> {
-  const { def, octokit, user, repoName, projectId, statusFieldId, todoOptionId } = args;
+  const { def, octokit, user, repoName, projectId, statusFieldId, todoOptionId, blocker } = args;
 
   const issueRes = await octokit.rest.issues.create({
     owner: user,
@@ -445,6 +470,20 @@ async function seedTask(args: {
     await setSelect(args.priorityFieldId, args.priorityOptionId);
   }
 
+  if (blocker) {
+    await graphql(
+      octokit,
+      `
+        mutation ($issueId: ID!, $blockingIssueId: ID!) {
+          addBlockedBy(input: { issueId: $issueId, blockingIssueId: $blockingIssueId }) {
+            clientMutationId
+          }
+        }
+      `,
+      { issueId: issueNodeId, blockingIssueId: blocker.issueNodeId }
+    );
+  }
+
   const slug = slugify(def.title);
 
   return {
@@ -454,6 +493,7 @@ async function seedTask(args: {
     itemId,
     slug,
     branch: `${issueNumber}-${slug}`,
+    base: blocker?.branch ?? 'main',
   };
 }
 
@@ -843,9 +883,18 @@ async function assertTaskLanded(run: RamondaRun, ctx: E2eCtx, task: E2eTask): Pr
   const taskStatePath = join(ctx.workDir, '.worktrees', task.branch, '.claude', 'ramonda-task.json');
   const taskState = JSON.parse(await readFile(taskStatePath, 'utf8'));
   expect(taskState.completedAt).toEqual(expect.any(String));
+  // What the Stop hook measured the session's work against — the blocker's
+  // branch for a stacked task, or its own commits would include the blocker's.
+  expect(taskState.baseBranch).toBe(task.base);
+
+  if (task.blockedBy !== undefined) {
+    const brief = await readFile(join(ctx.workDir, '.worktrees', task.branch, '.claude', 'AGENT_TASK.md'), 'utf8');
+    expect(brief).toContain('## Builds on');
+    expect(brief).toContain(task.base);
+  }
 
   const pr = await findPrSettled(ctx, task);
-  expect(pr.base.ref).toBe('main');
+  expect(pr.base.ref).toBe(task.base);
   expect(pr.head.ref).toBe(task.branch);
   expect(pr.body ?? '').toContain(`Closes #${task.issueNumber}`);
   // The URL the loop announced has to be the PR that actually exists. It is

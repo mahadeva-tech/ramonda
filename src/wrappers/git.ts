@@ -392,15 +392,19 @@ export class Git {
     return { discarded: dirty };
   }
 
+  /**
+   * `created` is whether the branch was cut from `baseRef` just now, rather than
+   * kept from an earlier attempt — only a kept one can have fallen behind it.
+   */
   async prepTaskWorktree(opts: {
     worktreePath: string;
     branch: string;
     baseRef: string;
-  }): Promise<{ reused: boolean; discarded: string | null }> {
+  }): Promise<{ reused: boolean; created: boolean; discarded: string | null }> {
     if (await pathExists(opts.worktreePath)) {
       const { discarded } = await this.#restoreWorktree(opts.worktreePath, opts.branch);
 
-      return { reused: true, discarded };
+      return { reused: true, created: false, discarded };
     }
 
     // Past that branch the directory is known not to exist, so a registration git
@@ -422,7 +426,7 @@ export class Git {
     if (await this.localBranchExists(opts.branch)) {
       await this.#run(['worktree', 'add', opts.worktreePath, opts.branch]);
 
-      return { reused: false, discarded: null };
+      return { reused: false, created: false, discarded: null };
     }
 
     // `baseRef` is a remote-tracking ref, so nothing here reads or writes a local
@@ -431,7 +435,38 @@ export class Git {
     // keeps whatever branch they were on.
     await this.#run(['worktree', 'add', '-b', opts.branch, opts.worktreePath, opts.baseRef]);
 
-    return { reused: false, discarded: null };
+    return { reused: false, created: true, discarded: null };
+  }
+
+  /**
+   * Merges `ref` into the checked-out branch, committing as the `GH_TOKEN`
+   * account the way `commit` does. `false` means it did not merge cleanly, and
+   * the merge has been aborted, so the tree is as it was.
+   */
+  async merge(ref: string): Promise<boolean> {
+    const identity = this.#commitIdentity;
+
+    if (!identity) {
+      throw new Error(`refusing to merge in ${this.#cwd}: this Git was built without a commit identity`);
+    }
+
+    const result = await this.#tryRun([
+      '-c',
+      `user.name=${identity.name}`,
+      '-c',
+      `user.email=${identity.email}`,
+      'merge',
+      '--no-edit',
+      ref,
+    ]);
+
+    if (result.exitCode === 0) {
+      return true;
+    }
+
+    await this.#tryRun(['merge', '--abort']);
+
+    return false;
   }
 
   /**
